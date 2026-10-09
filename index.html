@@ -1138,6 +1138,7 @@ function occursOn(ev, d) {
   if (r === 'weekly') return diffDays(ev.date, d) % 7 === 0;
   if (r === 'biweekly') return diffDays(ev.date, d) % 14 === 0;
   if (r === 'monthly') return d.slice(8) === ev.date.slice(8);
+  if (r === 'yearly') return d.slice(5) === ev.date.slice(5);
   return false;
 }
 const evSort = (a, b) => (b.ev.allDay - a.ev.allDay) || toMin(a.ev.start) - toMin(b.ev.start) || String(a.ev.title).localeCompare(b.ev.title);
@@ -1350,7 +1351,7 @@ function openModal(html, ctx = {}, focusSel) {
   closeMenus();
   modalCtx = ctx; $('#sheet').innerHTML = html; $('#overlay').classList.add('open');
   const f = focusSel ? $(focusSel, $('#sheet')) : null;
-  if (f && window.matchMedia('(min-width: 861px)').matches) setTimeout(() => f.focus(), 40);
+  if (f && window.matchMedia('(min-width: 861px)').matches) setTimeout(() => { if (!$('#sheet').contains(document.activeElement)) f.focus(); }, 40);
 }
 function closeModal() {
   if (!$('#overlay').classList.contains('open')) return;
@@ -1711,7 +1712,7 @@ actions['goals-month-to'] = el => { ui.goals.month = el.dataset.v; render(); };
 /* ---------- 5b. Agenda ---------- */
 registerModule({ id: 'agenda', label: 'Agenda', icon: 'calendar', order: 20, render: renderAgenda });
 
-const REPEATS = [['none', 'Niet'], ['daily', 'Elke dag'], ['weekdays', 'Elke werkdag (ma–vr)'], ['weekly', 'Elke week'], ['biweekly', 'Om de week'], ['monthly', 'Elke maand']];
+const REPEATS = [['none', 'Niet'], ['daily', 'Elke dag'], ['weekdays', 'Elke werkdag (ma–vr)'], ['weekly', 'Elke week'], ['biweekly', 'Om de week'], ['monthly', 'Elke maand'], ['yearly', 'Elk jaar']];
 const repeatLabel = r => (REPEATS.find(x => x[0] === r) || REPEATS[0])[1];
 const isMobile = () => window.matchMedia('(max-width: 860px)').matches;
 const hourH = () => isMobile() ? 44 : 48;
@@ -1897,7 +1898,7 @@ actions['ag-cals'] = () => {
       ${sw('agl-study', 'data-change="ag-layer" data-k="study"', L.study, 'Studiesessies', 'Met tijd in het rooster, zonder tijd bovenaan de dag')}
       ${sw('agl-sport', 'data-change="ag-layer" data-k="sport"', L.sport, 'Geplande trainingen', '')}
       ${sw('agl-deadlines', 'data-change="ag-layer" data-k="deadlines"', L.deadlines, 'Deadlines', '')}</div>`,
-    `<button class="btn btn-ghost" data-act="ag-manage">${icon('pencil')}Agenda's beheren</button><span class="spacer"></span><button class="btn btn-primary" data-act="close">Klaar</button>`));
+    `<button class="btn btn-ghost" data-act="ag-manage">${icon('pencil')}Beheren</button><button class="btn btn-ghost" data-act="ics-open">${icon('upload')}Importeren</button><span class="spacer"></span><button class="btn btn-primary" data-act="close">Klaar</button>`));
 };
 changes['ag-cal-vis'] = el => { const c = calById(el.dataset.id); if (c) { c.hidden = !el.checked; touchS(); requestRender(); } };
 changes['ag-layer'] = el => { const s = S(); s.agendaLayers = { ...(s.agendaLayers || {}), [el.dataset.k]: el.checked }; touchS(); requestRender(); };
@@ -1974,6 +1975,201 @@ actions['ev-del-one'] = () => {
   closeModal(); toast('Afspraak verwijderd'); render();
 };
 actions['ev-del-all'] = () => { const { id } = modalCtx; removeEvent(id); closeModal(); toast('Reeks verwijderd'); render(); };
+
+/* agenda importeren (.ics van Apple Agenda, Google, Outlook) */
+const ICS_DAYS = { MO: 0, TU: 1, WE: 2, TH: 3, FR: 4, SA: 5, SU: 6 };
+const icsUnfold = text => text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n[ \t]/g, '');
+const icsText = v => String(v || '').replace(/\\n/gi, '\n').replace(/\\([,;\\])/g, '$1').trim();
+function icsProp(line) {
+  let i = 0, q = false;
+  for (; i < line.length; i++) { const c = line[i]; if (c === '"') q = !q; else if (c === ':' && !q) break; }
+  const parts = line.slice(0, i).split(';'), params = {};
+  for (const p of parts.slice(1)) { const j = p.indexOf('='); if (j > 0) params[p.slice(0, j).toUpperCase()] = p.slice(j + 1).replace(/^"|"$/g, ''); }
+  return { name: parts[0].toUpperCase(), params, value: line.slice(i + 1) };
+}
+function tzOffsetMin(utcMs, tz) {
+  const f = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const p = Object.fromEntries(f.formatToParts(new Date(utcMs)).map(x => [x.type, x.value]));
+  return (Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second) - utcMs) / 60000;
+}
+function icsDate(prop) {
+  const m = String(prop.value || '').trim().match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})?(Z)?)?$/);
+  if (!m) return null;
+  const [, Y, Mo, D, h, mi, s, z] = m;
+  if (h === undefined || (prop.params || {}).VALUE === 'DATE') return { date: `${Y}-${Mo}-${D}`, time: null };
+  let local;
+  if (z) local = new Date(Date.UTC(+Y, +Mo - 1, +D, +h, +mi, +(s || 0)));
+  else if ((prop.params || {}).TZID) {
+    try {
+      const guess = Date.UTC(+Y, +Mo - 1, +D, +h, +mi);
+      let inst = guess - tzOffsetMin(guess, prop.params.TZID) * 60000;
+      inst = guess - tzOffsetMin(inst, prop.params.TZID) * 60000;
+      local = new Date(inst);
+    } catch (e) { local = new Date(+Y, +Mo - 1, +D, +h, +mi); }
+  } else local = new Date(+Y, +Mo - 1, +D, +h, +mi);
+  return { date: iso(local), time: `${pad(local.getHours())}:${pad(local.getMinutes())}` };
+}
+function icsDuration(v) {
+  const m = String(v || '').match(/^([+-])?P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/);
+  if (!m) return null;
+  return ((+m[2] || 0) * 7 * 1440 + (+m[3] || 0) * 1440 + (+m[4] || 0) * 60 + (+m[5] || 0)) * (m[1] === '-' ? -1 : 1);
+}
+function parseICS(text) {
+  const events = []; let cur = null, depth = 0, calName = '';
+  for (const raw of icsUnfold(text).split('\n')) {
+    const line = raw.trim(); if (!line) continue;
+    if (/^BEGIN:VEVENT$/i.test(line)) { cur = []; depth = 0; continue; }
+    if (!cur) { if (/^X-WR-CALNAME[;:]/i.test(line)) calName = icsText(icsProp(line).value); continue; }
+    if (/^BEGIN:/i.test(line)) { depth++; continue; }
+    if (/^END:/i.test(line)) { if (depth) { depth--; continue; } if (/^END:VEVENT$/i.test(line)) { events.push(cur); cur = null; } continue; }
+    if (!depth) cur.push(icsProp(line));
+  }
+  return { calName, events };
+}
+const rruleObj = v => { const o = {}; for (const p of String(v).split(';')) { const [k, x] = p.split('='); if (k) o[k.toUpperCase()] = x || ''; } return o; };
+function nthWeekday(y, m, wd, n) {
+  const last = new Date(y, m + 1, 0).getDate();
+  if (n > 0) { const off = (wd - ((new Date(y, m, 1).getDay() + 6) % 7) + 7) % 7, d = 1 + off + (n - 1) * 7; return d <= last ? iso(new Date(y, m, d)) : null; }
+  const off = (((new Date(y, m, last).getDay() + 6) % 7) - wd + 7) % 7, d = last - off + (n + 1) * 7;
+  return d >= 1 ? iso(new Date(y, m, d)) : null;
+}
+function expandRule(start, r, limit) {
+  const iv = Math.max(1, +r.INTERVAL || 1), count = +r.COUNT || 0;
+  const until = r.UNTIL ? (icsDate({ value: r.UNTIL, params: {} }) || {}).date : null, end = until && until < limit ? until : limit;
+  const days = String(r.BYDAY || '').split(',').filter(Boolean).map(x => { const m = x.match(/^([+-]?\d+)?([A-Z]{2})$/); return m && ICS_DAYS[m[2]] !== undefined ? { n: m[1] ? +m[1] : 0, wd: ICS_DAYS[m[2]] } : null; }).filter(Boolean);
+  const mdays = String(r.BYMONTHDAY || '').split(',').filter(Boolean).map(Number);
+  const out = [], full = () => count && out.length >= count;
+  const push = d => { if (d && d >= start && d <= end && !full()) out.push(d); };
+  let g = 0;
+  if (r.FREQ === 'DAILY') { for (let d = start; d <= end && g++ < 4000 && !full(); d = addDays(d, iv)) if (!days.length || days.some(x => x.wd === weekday(d))) push(d); }
+  else if (r.FREQ === 'WEEKLY') { const wds = days.length ? days.map(x => x.wd).sort() : [weekday(start)]; for (let w = weekStart(start); w <= end && g++ < 1500 && !full(); w = addDays(w, 7 * iv)) for (const wd of wds) push(addDays(w, wd)); }
+  else if (r.FREQ === 'MONTHLY') {
+    let [y, m] = start.split('-').map(Number); m -= 1;
+    while (g++ < 400 && !full() && iso(new Date(y, m, 1)) <= end) {
+      const last = new Date(y, m + 1, 0).getDate();
+      let ds = days.length ? days.map(x => nthWeekday(y, m, x.wd, x.n || 1)) : mdays.length ? mdays.map(md => { const dd = md > 0 ? md : last + md + 1; return dd >= 1 && dd <= last ? iso(new Date(y, m, dd)) : null; }) : [+start.slice(8) <= last ? iso(new Date(y, m, +start.slice(8))) : null];
+      ds.filter(Boolean).sort().forEach(push);
+      m += iv; y += Math.floor(m / 12); m %= 12;
+    }
+  } else if (r.FREQ === 'YEARLY') {
+    const [sy, sm, sd] = start.split('-').map(Number);
+    for (let y = sy; g++ < 150 && !full(); y += iv) { const d = iso(new Date(y, sm - 1, sd)); if (d > end) break; if (d.slice(5) === start.slice(5)) push(d); }
+  } else push(start);
+  return out;
+}
+function icsToEvents(parsed, opts) {
+  const limit = addDays(today(), 400), since = opts.since, out = [], overrides = {};
+  let skipped = 0, recurring = 0;
+  for (const props of parsed.events) {
+    const get = n => props.find(p => p.name === n), all = n => props.filter(p => p.name === n);
+    const st = get('DTSTART'), s = st && icsDate(st);
+    if (!s || /CANCELLED/i.test((get('STATUS') || {}).value || '')) { skipped++; continue; }
+    const uid = (get('UID') || {}).value || newId(), rid = get('RECURRENCE-ID');
+    if (rid) { const d = icsDate(rid); if (d) (overrides[uid] = overrides[uid] || []).push(d.date); }
+    const en = get('DTEND') && icsDate(get('DTEND')), dur = get('DURATION') ? icsDuration(get('DURATION').value) : null;
+    let allDay = !s.time, end = '', endDate = '';
+    if (allDay) {
+      const last = en ? addDays(en.date, -1) : dur ? addDays(s.date, Math.max(0, Math.ceil(dur / 1440) - 1)) : s.date;
+      if (last > s.date) endDate = last;
+    } else {
+      const st0 = toMin(s.time); let endMin = en ? toMin(en.time || '00:00') : st0 + (dur != null ? dur : 60);
+      const span = en ? diffDays(s.date, en.date) : Math.floor(endMin / 1440);
+      if (en) endMin += span * 1440;
+      if (endMin - st0 >= 1440) { allDay = true; const lastDay = addDays(s.date, Math.floor((endMin - 1) / 1440)); if (lastDay > s.date) endDate = lastDay; }
+      else end = fmtT(Math.min(1439, Math.max(endMin, st0 + 15)));
+    }
+    const base = { title: icsText((get('SUMMARY') || {}).value) || 'Afspraak', cal: opts.cal, allDay, start: allDay ? '09:00' : s.time, end: allDay ? '10:00' : end, endDate, location: icsText((get('LOCATION') || {}).value), notes: icsText((get('DESCRIPTION') || {}).value).slice(0, 2000), src: 'ics:' + opts.cal, uid };
+    const ex = [];
+    for (const p of all('EXDATE')) for (const v of p.value.split(',')) { const d = icsDate({ value: v.trim(), params: p.params }); if (d) ex.push(d.date); }
+    const rr = get('RRULE');
+    if (!rr || rid) {
+      if ((endDate || s.date) < since) { skipped++; continue; }
+      out.push({ ...base, id: newId(), date: s.date, repeat: 'none', until: '', exdates: [], _ovr: !!rid });
+      continue;
+    }
+    const r = rruleObj(rr.value), iv = Math.max(1, +r.INTERVAL || 1), days = String(r.BYDAY || '').split(',').filter(Boolean), plain = days.every(x => /^[A-Z]{2}$/.test(x));
+    let until = r.UNTIL ? ((icsDate({ value: r.UNTIL, params: {} }) || {}).date || '') : '';
+    if (r.COUNT) { const occ = expandRule(s.date, r, addDays(s.date, 3700)); until = occ[occ.length - 1] || s.date; }
+    if (until && until < since) { skipped++; continue; }
+    recurring++;
+    const add = (repeat, date, exd) => out.push({ ...base, id: newId(), date, repeat, until, exdates: exd, endDate: '' });
+    if (r.FREQ === 'DAILY' && iv === 1 && !days.length) add('daily', s.date, ex);
+    else if (r.FREQ === 'WEEKLY' && iv === 1 && days.length === 5 && ['MO', 'TU', 'WE', 'TH', 'FR'].every(x => days.includes(x))) add('weekdays', s.date, ex);
+    else if (r.FREQ === 'WEEKLY' && iv <= 2 && plain) {
+      for (const wd of (days.length ? days.map(x => ICS_DAYS[x]) : [weekday(s.date)])) {
+        let d = addDays(weekStart(s.date), wd); if (d < s.date) d = addDays(d, 7 * iv);
+        if (!until || d <= until) add(iv === 1 ? 'weekly' : 'biweekly', d, ex.filter(x => weekday(x) === wd));
+      }
+    } else if (r.FREQ === 'MONTHLY' && iv === 1 && !days.length && (!r.BYMONTHDAY || +r.BYMONTHDAY === +s.date.slice(8))) add('monthly', s.date, ex);
+    else if (r.FREQ === 'YEARLY' && iv === 1 && !days.length && !r.BYMONTHDAY && (!r.BYMONTH || +r.BYMONTH === +s.date.slice(5, 7))) add('yearly', s.date, ex);
+    else for (const d of expandRule(s.date, r, until && until < limit ? until : limit).filter(d => d >= since && !ex.includes(d)))
+      out.push({ ...base, id: newId(), date: d, repeat: 'none', until: '', exdates: [], endDate: base.endDate ? addDays(base.endDate, diffDays(s.date, d)) : '', _exp: true });
+  }
+  const events = [];
+  for (const ev of out) {
+    const o = overrides[ev.uid];
+    if (o && !ev._ovr) { if (ev.repeat !== 'none') ev.exdates = [...new Set([...ev.exdates, ...o])]; else if (ev._exp && o.includes(ev.date)) continue; }
+    delete ev._ovr; delete ev._exp; events.push(ev);
+  }
+  return { events, recurring, skipped, total: parsed.events.length };
+}
+const icsSince = v => v === 'all' ? '0000-00-00' : addMonths(today().slice(0, 7), -(+v)) + '-01';
+function openImportModal() {
+  const cs = S().calendars;
+  openModal(dlg('Agenda importeren', `
+    <p class="dlg-text" style="margin-bottom:16px">Kies een .ics-bestand dat je uit je agenda-app hebt geëxporteerd.</p>
+    <label class="field"><span class="lbl">Bestand</span><input type="file" accept=".ics,text/calendar" data-change="ics-file"></label>
+    <div id="ics-prev" class="gen-prev" hidden style="margin-bottom:16px"></div>
+    <div class="row2">
+      <label class="field"><span class="lbl">Importeren in</span><select id="ics-cal" data-change="ics-cal">${cs.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('')}<option value="__new">Nieuwe agenda</option></select></label>
+      <label class="field"><span class="lbl">Afspraken vanaf</span><select id="ics-since" data-change="ics-prev"><option value="3">3 maanden geleden</option><option value="12">1 jaar geleden</option><option value="all">Alles</option></select></label>
+    </div>
+    <label class="field" id="ics-newname-f" hidden><span class="lbl">Naam van de nieuwe agenda</span><input id="ics-newname" type="text" placeholder="Bijvoorbeeld iCloud"></label>
+    <p class="help">Importeer je later een nieuwer bestand in dezelfde agenda, dan worden de eerder geïmporteerde afspraken vervangen. Afspraken die je zelf in Dagstaat hebt gemaakt, blijven staan.</p>`,
+    dlgFoot('ics-import', 'Importeren')), { ics: null });
+}
+function icsPreview() {
+  const box = $('#ics-prev'); if (!box || !modalCtx.ics) return;
+  const r = icsToEvents(modalCtx.ics, { cal: 'x', since: icsSince($('#ics-since').value) });
+  box.hidden = false;
+  const n = r.total - r.skipped;
+  box.innerHTML = r.total ? `${icon('calendar')}<span><b>${n} ${n === 1 ? 'afspraak' : 'afspraken'}</b> worden geïmporteerd${modalCtx.ics.calName ? ` uit ${esc(modalCtx.ics.calName)}` : ''}${r.recurring ? `, waarvan ${r.recurring} herhalend` : ''}.${r.skipped ? ` ${r.skipped} ${r.skipped === 1 ? 'wordt' : 'worden'} overgeslagen omdat ze ouder zijn dan de gekozen periode of geannuleerd zijn.` : ''}</span>`
+    : `<span class="neg">Er staan geen afspraken in dit bestand. Is het een .ics-bestand?</span>`;
+}
+changes['ics-file'] = el => {
+  const f = el.files && el.files[0]; if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    try { modalCtx.ics = parseICS(String(rd.result || '')); } catch (e) { modalCtx.ics = { calName: '', events: [] }; }
+    const name = modalCtx.ics.calName, match = S().calendars.find(c => name && c.name.toLowerCase() === name.toLowerCase());
+    const sel = $('#ics-cal');
+    if (sel) { sel.value = match ? match.id : '__new'; $('#ics-newname-f').hidden = !!match; if (!match) $('#ics-newname').value = name || f.name.replace(/\.ics$/i, ''); }
+    icsPreview();
+  };
+  rd.readAsText(f);
+};
+changes['ics-cal'] = el => { $('#ics-newname-f').hidden = el.value !== '__new'; };
+changes['ics-prev'] = () => icsPreview();
+actions['ics-open'] = () => openImportModal();
+actions['ics-import'] = () => {
+  const ics = modalCtx.ics;
+  if (!ics || !ics.events.length) return formErr('Kies eerst een .ics-bestand met afspraken.');
+  let cal = $('#ics-cal').value;
+  if (cal === '__new') { const cs = S().calendars, c = { id: newId(), name: $('#ics-newname').value.trim() || ics.calName || 'Geïmporteerd', color: PALETTE[(cs.length + 3) % PALETTE.length] }; cs.push(c); cal = c.id; }
+  const res = icsToEvents(ics, { cal, since: icsSince($('#ics-since').value) });
+  for (const k of Object.keys(Store.b)) if (k.startsWith('ev-')) {
+    const items = Store.b[k].items || [], keep = items.filter(e => e.src !== 'ics:' + cal);
+    if (keep.length !== items.length) { Store.b[k].items = keep; Store.touch(k); }
+  }
+  const byKey = {};
+  for (const ev of res.events) (byKey[evKey(ev.date)] = byKey[evKey(ev.date)] || []).push(ev);
+  for (const [k, list] of Object.entries(byKey)) { Store.ensure(k, () => ({ items: [] })).items.push(...list); Store.touch(k); }
+  const c = calById(cal); if (c) { c.importedAt = today(); c.importCount = res.total - res.skipped; c.hidden = false; }
+  touchS(); closeModal();
+  const n = res.total - res.skipped;
+  toast(`${n} ${n === 1 ? 'afspraak' : 'afspraken'} geïmporteerd`);
+  ui.agenda.date = today(); ui.agenda.scroll = null; go('agenda');
+};
 </script>
 <script>
 /* ---------- 5c. Studie ---------- */
@@ -3300,10 +3496,14 @@ function setAgenda() {
     `<section class="card">
       <ul class="edit-list">${cs.map(c => `<li><button class="swatch" style="background:${c.color}" data-act="cal-color" data-id="${esc(c.id)}" aria-label="Andere kleur voor ${esc(c.name)}" title="Klik voor een andere kleur"></button>
         <input id="cal-${esc(c.id)}" type="text" value="${esc(c.name)}" data-change="cal-rename" data-id="${esc(c.id)}" aria-label="Naam">
-        <span class="faint small nowrap">${allEvents().filter(e => e.cal === c.id).length} afspr.</span>
+        <span class="faint small nowrap" title="${c.importedAt ? 'Laatst geïmporteerd op ' + fmtDayLong(c.importedAt) : ''}">${c.importedAt ? icon('upload') + ' ' : ''}${allEvents().filter(e => e.cal === c.id).length} afspr.</span>
         <button class="btn btn-ghost btn-sm btn-icon" data-act="cal-del" data-id="${esc(c.id)}" aria-label="${esc(c.name)} verwijderen" ${cs.length < 2 ? 'disabled' : ''}>${icon('x')}</button></li>`).join('')}</ul>
       <div class="add-row"><input id="cal-new" type="text" placeholder="Bijvoorbeeld Sport of Familie" data-enter="cal-add"><button class="btn btn-sm" data-act="cal-add">Toevoegen</button></div>
-    </section>`);
+    </section>`)
+  + setSec('Importeren', 'Haal afspraken uit Apple Agenda, Google Agenda of Outlook binnen met een .ics-bestand. Importeer je opnieuw in dezelfde agenda, dan worden eerder geïmporteerde afspraken vervangen.',
+    `<section class="card"><div class="card-b" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+      <span class="muted">${cs.filter(c => c.importedAt).map(c => `${esc(c.name)}: ${c.importCount || 0} afspraken op ${fmtDayLong(c.importedAt)}`).join('<br>') || 'Nog niets geïmporteerd'}</span>
+      <button class="btn" data-act="ics-open">${icon('upload')}Agenda importeren</button></div></section>`);
 }
 actions['cal-color'] = el => { const c = calById(el.dataset.id); if (!c) return; const i = PALETTE.indexOf(c.color); c.color = PALETTE[(i + 1) % PALETTE.length]; touchS(); render(); };
 changes['cal-rename'] = el => { const c = calById(el.dataset.id), v = el.value.trim(); if (c && v) { c.name = v; touchS(); } render(); };
@@ -3440,6 +3640,7 @@ function setGeneral() {
       `<section class="card"><div class="card-b"><div class="status-row ${cloud ? 'ok' : ''}">${icon(cloud ? 'cloud' : Store.mode === 'local' ? 'monitor' : 'loader', Store.mode === 'starting' ? 'spin' : '')}${cloud ? 'Gesynchroniseerd met je account' : Store.mode === 'local' ? 'Alleen opgeslagen in deze browser' : 'Gegevens laden…'}</div></div></section>`)
     + setSec('Back-up', 'Een bestand met al je doelen, transacties, trainingen en instellingen.',
       `<section class="card"><div class="card-b" style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" data-act="export">${icon('download')}Back-up downloaden</button><button class="btn" data-act="import-open">${icon('upload')}Back-up terugzetten</button></div></section>`)
+    + setSec('Over Dagstaat', '', `<section class="card"><div class="card-b"><div class="status-row">${LOGO.replace('class="logo"', 'class="logo" style="width:24px;height:24px"')}Versie ${APP_VERSION}<span class="faint" style="font-weight:400">${APP_DATE}</span></div></div></section>`)
     + setSec('Alles wissen', 'Verwijdert al je gegevens en zet de standaardinstellingen terug. Dit kun je niet ongedaan maken.',
       `<section class="card"><div class="card-b"><button class="btn btn-danger" data-act="wipe">${icon('trash')}Alles wissen</button></div></section>`, 'danger');
 }
@@ -3449,7 +3650,7 @@ actions.theme = el => {
   try { if (v === 'light') localStorage.removeItem('dagstaat-theme'); else localStorage.setItem('dagstaat-theme', v); } catch (e) { }
   applyTheme(v); render();
 };
-function backupJSON() { return JSON.stringify({ app: 'dagstaat', v: 4, exported: new Date().toISOString(), buckets: Store.b }, null, 2); }
+function backupJSON() { return JSON.stringify({ app: 'dagstaat', v: 4, version: APP_VERSION, exported: new Date().toISOString(), buckets: Store.b }, null, 2); }
 actions.export = async () => {
   const data = backupJSON(), filename = `dagstaat-backup-${today()}.json`;
   let dl = null;
@@ -3491,6 +3692,7 @@ actions.wipe = () => {
 };
 
 /* ---------- Start ---------- */
+const APP_VERSION = '1.1', APP_DATE = '8 oktober 2026';
 Store.loadLocal();
 S();
 applyTheme(currentTheme());
